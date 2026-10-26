@@ -9,7 +9,9 @@
 Options:
   --copy      copy instead of symlink (default: symlink, so `git pull` updates it)
   --project   install into ./.claude/skills/ (current project) instead of ~/.claude/skills/
-  --force     replace an existing different install (it's renamed to <name>.bak-<date>, not deleted)
+  --force     replace an existing different install (it's moved to <claude dir>/skills-backup/, not deleted)
+
+The Claude directory is ~/.claude, or $CLAUDE_CONFIG_DIR if set (ignored with --project).
 """
 from __future__ import annotations
 
@@ -23,13 +25,38 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 SKILLS = REPO / "skills"
 
+for _s in (sys.stdout, sys.stderr):  # non-ASCII paths on Windows consoles/pipes
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def available() -> dict[str, Path]:
     return {p.name: p for p in sorted(SKILLS.iterdir()) if (p / "SKILL.md").is_file()}
 
 
+def claude_dir(project: bool) -> Path:
+    if project:
+        return Path.cwd() / ".claude"
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env).expanduser() if env else Path.home() / ".claude"
+
+
 def target_dir(project: bool) -> Path:
-    return (Path.cwd() if project else Path.home()) / ".claude" / "skills"
+    return claude_dir(project) / "skills"
+
+
+def backup_path(dest_root: Path, name: str) -> Path:
+    """Outside the skills folder, so Claude Code doesn't load the backup as a second skill."""
+    root = dest_root.parent / "skills-backup"
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path, n = root / f"{name}.{stamp}", 1
+    while path.exists():
+        n += 1
+        path = root / f"{name}.{stamp}-{n}"
+    return path
 
 
 def describe(dst: Path, src: Path) -> str:
@@ -55,12 +82,12 @@ def install(name: str, src: Path, dest_root: Path, copy: bool, force: bool) -> b
         if not force:
             print(f"! {name}: {dst} already exists ({state}). Use --force to replace it (it'll be backed up).")
             return False
-        backup = dst.with_name(f"{name}.bak-{datetime.now():%Y%m%d-%H%M%S}")
         if dst.is_symlink():
             dst.unlink()
             print(f"  removed old link {dst}")
         else:
-            dst.rename(backup)
+            backup = backup_path(dest_root, name)
+            shutil.move(str(dst), str(backup))
             print(f"  backed up {dst} -> {backup}")
 
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -119,7 +146,8 @@ def main() -> int:
         return 0
 
     names = list(skills) if a.all else a.skills
-    unknown = [n for n in names if n not in skills]
+    # Uninstalling works for skills that are no longer in the repo, too.
+    unknown = [] if a.uninstall else [n for n in names if n not in skills]
     if unknown:
         print(f"Unknown skill(s): {', '.join(unknown)}. Available: {', '.join(skills)}")
         return 1

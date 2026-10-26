@@ -208,7 +208,8 @@ def choose_times(duration: float, start: float, end: float | None, chapters: lis
 
 def extract_frame(src: Path, t: float, dst: Path, height: int) -> bool:
     p = run([ffmpeg(), "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", str(src), "-frames:v", "1",
-             "-vf", f"scale=-2:'min({height},ih)'", "-q:v", "3", str(dst)], check=False)
+             "-vf", f"scale=-2:'min({height},ih)'", "-q:v", "3",
+             "-update", "1", str(dst)], check=False)  # -update: a '%' in the path isn't a pattern
     return p.returncode == 0 and dst.exists() and dst.stat().st_size > 0
 
 

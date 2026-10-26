@@ -19,6 +19,7 @@ import sysconfig
 
 MODEL = "small"
 COMPUTE = "int8"
+CUDA_FAILED_MID_RUN = 75  # exit code; video_context.py then continues on CPU
 
 
 def nvidia_lib_dirs() -> list[str]:
@@ -101,7 +102,15 @@ def main() -> int:
                                    ensure_ascii=False) + "\n")
                 f.flush()
             say(f"PROGRESS {seg.end + a.offset:.1f}")
-            seg = next(segments, None)
+            try:
+                seg = next(segments, None)
+            except Exception as e:
+                if device != "cuda" or a.strict_device:
+                    raise
+                # GPU failed mid-run (e.g. out of memory): segments so far are saved; the caller
+                # resumes on CPU from the last one.
+                print(f"CUDA failed mid-run: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                return CUDA_FAILED_MID_RUN
         f.write(json.dumps({"done": True, "language": info.language, "device": device,
                             "model": f"{MODEL} {COMPUTE}"}) + "\n")
     return 0

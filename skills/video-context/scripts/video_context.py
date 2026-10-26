@@ -53,10 +53,10 @@ GPU_MIN_FREE_MB = 1536
 FRAME_HEIGHT = 720
 STT_SPEED = {"cuda": 40.0, "cpu": 6.0}  # x realtime, rough; for the up-front estimate only
 
+# Errors a login can fix. A plain rate limit (429) is not one: it fails with advice to wait.
 BLOCKED = re.compile(
-    r"log ?in|sign ?in|cookies|not a bot|rate.?limit|429|too many requests|age.?restrict|confirm your age|"
-    r"members.?only|join this channel|authenticat|inappropriate|requested content is not available|"
-    r"private", re.I)
+    r"log ?in|sign ?in|cookies|not a bot|age.?restrict|confirm your age|members.?only|join this channel|"
+    r"authenticat|inappropriate|requested content is not available|empty media response|private", re.I)
 BROKEN = re.compile(
     r"unable to extract|nsig|signature extraction|failed to parse json|unable to download (api|webpage)|"
     r"no video formats found|precondition check failed", re.I)
@@ -64,6 +64,10 @@ UNAVAILABLE = re.compile(r"video unavailable|has been removed|not available in y
                          r"does not exist|404|this video is private|private video", re.I)
 
 rep = Reporter()
+
+
+class CudaFailedMidRun(Exception):
+    """The GPU failed after transcription started; the saved segments are kept and STT resumes on CPU."""
 
 
 class UpgradeRetry(Exception):
@@ -204,7 +208,12 @@ def choose_cookies(job, msg: str) -> str:
     rep.log(f"{dom} blocked the request without a login ({explain(msg)[:120]}). "
             f"Checking installed browsers for a {dom} login...")
     rep.status(stage="checking browser logins")
-    res = cookies.scan(dom)
+    try:
+        res = cookies.scan(dom)
+    except Exception as e:  # e.g. a yt-dlp update renamed an internal helper
+        raise Failed(f"{dom} needs a login, and checking the installed browsers failed "
+                     f"({type(e).__name__}: {str(e)[:150]}). Try --cookies-from-browser firefox, "
+                     f"or download the video yourself and pass the file.")
     hints = []
     if sys.platform == "win32" and any(u.split(" ")[0] in ("chrome", "edge", "brave") for u in res["unreadable"]):
         hints.append("Chrome/Edge/Brave cookies on Windows are often unreadable: close the browser fully, or log in with Firefox.")
@@ -273,7 +282,7 @@ def fetch_info(job) -> dict:
 def download(job, fmt: str, dest_stem: Path, what: str, **extra) -> Path:
     """Download the whole file. (yt-dlp's section downloads stream through ffmpeg at
     roughly real-time speed; a full native download and a local cut is far faster.)"""
-    opts = {"format": fmt, "outtmpl": str(dest_stem) + ".%(ext)s", "skip_download": False,
+    opts = {"format": fmt, "outtmpl": str(dest_stem).replace("%", "%%") + ".%(ext)s", "skip_download": False,
             "overwrites": True, "continuedl": False}
     opts.update(extra)
     rep.log(what[0].upper() + what[1:] + "...")
@@ -297,19 +306,22 @@ def download(job, fmt: str, dest_stem: Path, what: str, **extra) -> Path:
 
 
 def sponsor_segments(video_id: str) -> list[dict]:
-    """SponsorBlock (no account needed). Failures are silent."""
+    """SponsorBlock (no account needed). Uses the hash-prefix lookup, so the server only sees
+    the first 4 hex digits of sha256(video id), shared by many videos. Failures are silent."""
     import urllib.request
     cats = ["sponsor", "selfpromo", "interaction"]
     labels = {"sponsor": "SPONSOR", "selfpromo": "SELF-PROMO", "interaction": "SUBSCRIBE-REMINDER"}
-    url = ("https://sponsor.ajay.app/api/skipSegments?" +
-           urlencode({"videoID": video_id, "categories": json.dumps(cats)}))
+    prefix = hashlib.sha256(video_id.encode()).hexdigest()[:4]
+    url = (f"https://sponsor.ajay.app/api/skipSegments/{prefix}?" +
+           urlencode({"categories": json.dumps(cats)}))
     try:
         with urllib.request.urlopen(url, timeout=8) as r:
             data = json.loads(r.read().decode())
     except Exception:
         return []
-    return [{"start": s["segment"][0], "end": s["segment"][1], "label": labels.get(s.get("category"), "SPONSOR")}
-            for s in data if s.get("segment")]
+    video = next((v for v in data if v.get("videoID") == video_id), None) if isinstance(data, list) else None
+    return [{"start": seg["segment"][0], "end": seg["segment"][1], "label": labels.get(seg.get("category"), "SPONSOR")}
+            for seg in (video or {}).get("segments", []) if seg.get("segment")]
 
 
 # ============================================================ transcript
@@ -349,7 +361,7 @@ def transcript_from_captions(job) -> dict | None:
     lines = captions.cues_to_lines(captions.parse_cues(text))
     if not lines:
         return None
-    lang = key.removesuffix("-orig")
+    lang = re.sub(r"-[A-Za-z0-9_]{8,}$", "", key.removesuffix("-orig"))  # "en-5IebwaT_cAk" -> "en"
     site = meta.get("extractor_key") or job["site"]
     return {"source": f"{site} {kind} ({lang})", "lang": lang, "lines": lines}
 
@@ -396,7 +408,8 @@ def transcript_from_stt(job) -> dict | None:
     duration = meta.get("duration")
     start, end = a.range or (0.0, None)
     end_eff = min(end, duration) if (end and duration) else (end or duration)
-    jsonl = outdir / f"stt_{int(start)}_{int(end_eff or 0)}.jsonl"
+    # Named by the requested range, not the duration (which some sites only reveal after download).
+    jsonl = outdir / ("stt_full.jsonl" if not a.range else f"stt_{int(start)}-{int(end) if end else 'end'}.jsonl")
     segs, done = read_stt(jsonl)
     if not done:
         resume = max(start, segs[-1]["end"] if segs else start)
@@ -405,18 +418,16 @@ def transcript_from_stt(job) -> dict | None:
         if remaining is not None and remaining < 1:
             done = {"language": None, "device": device, "model": "small int8"}
         else:
-            if remaining and remaining > STT_ASK_SECONDS and not a.yes:
-                est = remaining / STT_SPEED[device]
-                raise NeedsInput(
-                    f"No captions, so this needs speech-to-text on {fmt_ts(remaining)} of audio. "
-                    f"Estimated time on {device.upper()} ({why}): about {max(1, round(est / 60))} min "
-                    f"(+ a one-time ~500 MB model download). Ask the user, then run again with one of:\n"
-                    f"  --yes                      # transcribe it all\n"
-                    f"  --range 10:00-25:00        # only a section (any START-END)\n"
-                    f"  --no-stt                   # skip speech-to-text")
+            ask_before_long_stt(a, remaining, device, why)
             if segs:
                 rep.log(f"Resuming speech-to-text from {fmt_ts(resume)}")
-            done = run_stt(job, resume, end_eff, jsonl, device, idx, why)
+            try:
+                run_stt(job, resume, end_eff, jsonl, device, idx, why)
+            except CudaFailedMidRun as e:
+                segs, _ = read_stt(jsonl)
+                resume = max(start, segs[-1]["end"] if segs else start)
+                rep.log(f"GPU failed during speech-to-text ({e}); continuing on CPU from {fmt_ts(resume)}")
+                run_stt(job, resume, end_eff, jsonl, "cpu", 0, "GPU failed mid-run")
             segs, done = read_stt(jsonl)
             if done is None:
                 raise Failed(f"Speech-to-text stopped early. See {outdir / 'stt.log'}")
@@ -428,6 +439,18 @@ def transcript_from_stt(job) -> dict | None:
             "lang": done.get("language"), "lines": [(s["start"], s["text"]) for s in segs]}
 
 
+def ask_before_long_stt(a, remaining: float | None, device: str, why: str) -> None:
+    if remaining and remaining > STT_ASK_SECONDS and not a.yes:
+        est = remaining / STT_SPEED[device]
+        raise NeedsInput(
+            f"No captions, so this needs speech-to-text on {fmt_ts(remaining)} of audio. "
+            f"Estimated time on {device.upper()} ({why}): about {max(1, round(est / 60))} min "
+            f"(+ a one-time ~500 MB model download). Ask the user, then run again with one of:\n"
+            f"  --yes                      # transcribe it all\n"
+            f"  --range 10:00-25:00        # only a section (any START-END)\n"
+            f"  --no-stt                   # skip speech-to-text")
+
+
 def run_stt(job, resume: float, end: float | None, jsonl: Path, device: str, idx: int, why: str):
     a, outdir = job["args"], job["outdir"]
     tmp = outdir / "tmp"
@@ -437,6 +460,11 @@ def run_stt(job, resume: float, end: float | None, jsonl: Path, device: str, idx
         media.to_wav(job["path"], wav, resume, end)
     else:
         src = download(job, "ba/b", tmp / "audio", "downloading audio")
+        if not job["meta"].get("duration"):
+            # Some sites only reveal the length once the file is here: check again before transcribing.
+            job["meta"]["duration"] = media.probe(src).get("duration")
+            if job["meta"]["duration"]:
+                ask_before_long_stt(a, (end or job["meta"]["duration"]) - resume, device, why)
         media.to_wav(src, wav, resume, end)
         src.unlink(missing_ok=True)
     uv = os.environ.get("UV") or shutil.which("uv")
@@ -475,6 +503,8 @@ def run_stt(job, resume: float, end: float | None, jsonl: Path, device: str, idx
                 if line.startswith("DEVICE"):
                     rep.status(stage="speech-to-text", device=line.split()[1])
         rc = p.wait()
+    if rc == 75 and device == "cuda" and a.device != "cuda":
+        raise CudaFailedMidRun("see stt.log")
     if rc != 0:
         tail = (outdir / "stt.log").read_text(encoding="utf-8", errors="replace").strip().splitlines()[-8:]
         raise Failed("Speech-to-text failed:\n" + "\n".join(tail))
@@ -490,12 +520,6 @@ def do_frames(job) -> dict | None:
     prev = job["state"].get("frames")
     if prev and prev.get("params") == params and all(Path(f["path"]).exists() for f in prev["items"]):
         return prev
-    duration = meta.get("duration")
-    if not duration:
-        raise Failed("Can't take frames: the video's duration is unknown.")
-    start, end = a.range or (0.0, None)
-    end = min(end, duration) if end else duration
-
     tmp_video = None
     if job["kind"] == "local":
         if not meta.get("has_video"):
@@ -507,6 +531,15 @@ def do_frames(job) -> dict | None:
         (outdir / "tmp").mkdir(exist_ok=True)
         src = tmp_video = download(job, f"bv*[height<={FRAME_HEIGHT}]/b[height<={FRAME_HEIGHT}]/wv*/w",
                                    outdir / "tmp" / "frames_src", f"downloading {FRAME_HEIGHT}p video for frames")
+
+    duration = meta.get("duration")
+    if not duration:  # some sites (e.g. Instagram) don't report it; read it from the file
+        duration = media.probe(src).get("duration")
+        if not duration:
+            raise Failed("Can't take frames: the video's duration is unknown.")
+        meta["duration"] = duration
+    start, end = a.range or (0.0, None)
+    end = min(end, duration) if end else duration
 
     if a.at:
         times = [parse_ts(x) for x in a.at.split(",") if x.strip()]
@@ -566,8 +599,16 @@ def save_media(job) -> dict:
 
 # ============================================================ context.md
 
+_FENCE = re.compile(r"<\s*(/?)\s*untrusted[\s_-]*content", re.I)
+
+
 def fence(text: str) -> str:
-    return (text or "").replace("untrusted-content", "untrusted_content")
+    """Neutralise anything in downloaded text that could open or close an untrusted block."""
+    return _FENCE.sub(r"<\1untrusted_text", text or "")
+
+
+def one_line(text) -> str:
+    return fence(re.sub(r"\s+", " ", str(text or ""))).strip()
 
 
 def build_context(job) -> tuple[str, int]:
@@ -575,16 +616,24 @@ def build_context(job) -> tuple[str, int]:
     meta, st, a = job["meta"], job["state"], job["args"]
     L: list[str] = []
     title = meta.get("title") or (job["path"].name if job["kind"] == "local" else meta.get("id"))
-    L.append(f"# {title}")
+    # Everything the uploader controls (title, channel name, tags, chapter titles, description,
+    # comments, transcript) goes inside <untrusted-content> blocks; the rest is ours.
+    L.append(f"# Video context: {meta.get('extractor_key') or job['site']} {meta.get('id') or job['path'].name}")
+    L.append("")
+    L.append('<untrusted-content source="metadata">')
+    L.append(f"Title: {one_line(title)}")
+    who = meta.get("channel") or meta.get("uploader") or meta.get("artist")
+    if who:
+        L.append(f"By: {one_line(who)}" + (f" ({one_line(meta['channel_url'])})" if meta.get("channel_url") else ""))
+    if meta.get("tags"):
+        L.append(f"Tags: {one_line(', '.join(map(str, meta['tags'][:20])))}")
+    L.append("</untrusted-content>")
     L.append("")
     if job["kind"] == "local":
         L.append(f"- **File:** {job['path']}")
     else:
         L.append(f"- **URL:** {meta.get('webpage_url') or job['url']}")
         L.append(f"- **Site:** {meta.get('extractor_key') or job['site']}")
-    who = meta.get("channel") or meta.get("uploader") or meta.get("artist")
-    if who:
-        L.append(f"- **By:** {who}" + (f" ({meta['channel_url']})" if meta.get("channel_url") else ""))
     if meta.get("upload_date"):
         d = meta["upload_date"]
         L.append(f"- **Uploaded:** {d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else f"- **Uploaded:** {d}")
@@ -604,22 +653,22 @@ def build_context(job) -> tuple[str, int]:
     L.append(f"- **Transcript:** {tr['source'] if tr else 'none available'}")
     if a.range:
         L.append(f"- **Range:** {fmt_ts(a.range[0])}–{fmt_ts(a.range[1]) if a.range[1] else 'end'} "
-                 f"(speech-to-text and frames only)")
-    if st.get("cookies"):
-        L.append(f"- **Login cookies used:** {cookies.describe(st['cookies'])} for {cookies.site_domain(job['url'])}")
+                 f"(speech-to-text, frames and saved files; a caption transcript is not trimmed)")
+    if job.get("cookies"):
+        L.append(f"- **Login cookies used:** {cookies.describe(job['cookies'])} for {cookies.site_domain(job['url'])}")
     for k, v in (st.get("saved") or {}).items():
         if k != "video_full":
             L.append(f"- **Saved {k}:** {v}")
     L.append(f"- **Folder:** {job['outdir']}")
-    if meta.get("tags"):
-        L.append(f"- **Tags:** {', '.join(meta['tags'][:20])}")
     L.append("")
 
     if meta.get("chapters"):
         L.append("## Chapters")
         L.append("")
+        L.append('<untrusted-content source="chapters">')
         for c in meta["chapters"]:
-            L.append(f"- [{fmt_ts(c.get('start_time'))}] {fence(c.get('title') or '')}")
+            L.append(f"- [{fmt_ts(c.get('start_time'))}] {one_line(c.get('title'))}")
+        L.append("</untrusted-content>")
         L.append("")
 
     desc = meta.get("description") or meta.get("comment")
@@ -809,6 +858,8 @@ def main(argv=None) -> int:
         return 0
     if a.update:
         uv = os.environ.get("UV") or shutil.which("uv")
+        if not uv:
+            raise Failed("uv not found on PATH.")
         return subprocess.call([uv, "run", "--quiet", "--upgrade-package", "yt-dlp",
                                 str(Path(__file__).resolve()), "--version"])
     if a.stop or a.stop_all:
@@ -863,11 +914,9 @@ def main(argv=None) -> int:
                 p.unlink(missing_ok=True)
             shutil.rmtree(outdir / "frames", ignore_errors=True)
         job["state"] = state
-        if state.get("cookies") and not job["cookies"] and not a.no_cookies:
-            job["cookies"] = state["cookies"]
 
         def save():
-            state["cookies"] = job["cookies"]
+            state.pop("cookies", None)  # only the current run's choice is shown; nothing is reused
             state["updated"] = now_iso()
             write_json(outdir / "info.json", state)
 
@@ -922,11 +971,13 @@ def main(argv=None) -> int:
             if tr is not None:
                 tr["requested_lang"] = a.lang
         state["transcript"] = tr
+        state["meta"] = {k: v for k, v in job["meta"].items() if not k.startswith("_")}  # may have gained duration
         save()
 
         # ---- frames
         if a.frames:
             state["frames"] = do_frames(job)
+            state["meta"] = {k: v for k, v in job["meta"].items() if not k.startswith("_")}
             save()
 
         text, tline = build_context(job)

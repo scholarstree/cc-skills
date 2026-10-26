@@ -38,17 +38,22 @@ def pick_track(info: dict, want: str | None) -> tuple[str, str, list] | None:
     orig = info.get("language")
 
     # The original-language auto track. YouTube labels it "<lang>-orig"; every other
-    # auto track there is a machine translation of it.
+    # auto track there is a machine translation of it. Auto-dubbed videos have one
+    # "-orig" track per dubbed audio language, so pick the one in the video's own language.
     auto_orig = None
     origs = [k for k in auto if k.endswith("-orig")]
     if origs:
-        auto_orig = origs[0]
+        def orig_in(lang):
+            return next((k for k in origs if lang and _base(k.removesuffix("-orig")) == _base(lang)), None)
+        auto_orig = orig_in(orig) or orig_in("en") or origs[0]
     elif auto:
         auto_orig = _match(auto, orig) or (_match(auto, "en") if len(auto) <= 3 else None)
         if auto_orig is None and len(auto) <= 3:
             auto_orig = next(iter(auto))
 
     def auto_in(lang):
+        if origs:
+            return orig_in(lang)
         if auto_orig and lang and _base(auto_orig.removesuffix("-orig")) == _base(lang):
             return auto_orig
         return None
